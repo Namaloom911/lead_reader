@@ -2,19 +2,16 @@ import pandas as pd
 from typing import Tuple
 
 def _find_col(df: pd.DataFrame, checks) -> str | None:
-    cols = [str(c) for c in df.columns]
-    for c in cols:
-        lc = c.lower().strip()
-        for pat in checks:
-            if pat.startswith("*") and pat.endswith("*"):
-                if pat.strip("*") in lc:
-                    return c
-            else:
-                if lc == pat:
-                    return c
+    """Find a column in df matching any name in checks (set or list)."""
+    for c in df.columns:
+        lc = str(c).strip().lower()
+        for chk in checks:
+            if chk in lc:
+                return c
     return None
 
 def _clean_currency_to_float(series: pd.Series) -> pd.Series:
+    """Convert currency-like strings to floats."""
     return (
         series.astype(str)
         .str.replace(r"[^\d.\-]", "", regex=True)
@@ -67,7 +64,7 @@ def process_sales_data(sales_df: pd.DataFrame, bats_df: pd.DataFrame) -> Tuple[p
             .agg({deposit_col_sales: "sum"})
         )
 
-    # Prepare for matching
+    # Prepare minimal BATS & Sales views
     bats_min = bats_df[[c for c in bats_df.columns if c in {
         order_id_col_bats, name_col_bats, bats_assigned_col, source_col_bats
     }]].copy()
@@ -76,40 +73,39 @@ def process_sales_data(sales_df: pd.DataFrame, bats_df: pd.DataFrame) -> Tuple[p
         order_id_col_sales, name_col_sales, sales_agent_col, deposit_col_sales
     }]].copy()
 
-    # --- First pass: Order ID + Agent ---
-    first_pass = pd.DataFrame()
-    if order_id_col_sales and order_id_col_bats:
-        first_pass = pd.merge(
-            sales_min,
-            bats_min,
-            left_on=[order_id_col_sales, sales_agent_col],
-            right_on=[order_id_col_bats, bats_assigned_col],
-            how="inner",
-            suffixes=("_sales", "_bats"),
-        )
+    # --- Condition 1: Match by Order ID + Agent ---
+    first_pass = pd.merge(
+        sales_min,
+        bats_min,
+        left_on=[order_id_col_sales, sales_agent_col],
+        right_on=[order_id_col_bats, bats_assigned_col],
+        how="left",
+        suffixes=("_sales", "_bats")
+    )
+    first_pass.rename(columns={source_col_bats: "Matched_Source"}, inplace=True)
 
-    # --- Second pass: Name + Agent (only unmatched) ---
-    if not first_pass.empty and order_id_col_sales in first_pass.columns:
-        matched_ids = set(first_pass[order_id_col_sales].dropna().astype(str).unique())
-        unmatched_sales = sales_min[~sales_min[order_id_col_sales].astype(str).isin(matched_ids)].copy()
-    else:
-        unmatched_sales = sales_min.copy()
-
-    second_pass = pd.merge(
-        unmatched_sales,
+    # --- Condition 2: If Condition 1 matched, also check Name + Agent ---
+    name_agent_merge = pd.merge(
+        sales_min,
         bats_min,
         left_on=[name_col_sales, sales_agent_col],
         right_on=[name_col_bats, bats_assigned_col],
-        how="inner",
-        suffixes=("_sales", "_bats"),
+        how="left",
+        suffixes=("", "_bats_name")
     )
+    name_agent_merge.rename(columns={source_col_bats: "NameAgent_Source"}, inplace=True)
 
-    # --- Combine all matches ---
-    combined = pd.concat([first_pass, second_pass], ignore_index=True)
+    # Override source if Name+Agent source is found and different
+    first_pass["NameAgent_Source"] = name_agent_merge["NameAgent_Source"]
+    mask_override = (
+        first_pass["Matched_Source"].notna() &
+        first_pass["NameAgent_Source"].notna() &
+        (first_pass["Matched_Source"] != first_pass["NameAgent_Source"])
+    )
+    first_pass.loc[mask_override, "Matched_Source"] = first_pass.loc[mask_override, "NameAgent_Source"]
 
-    # --- Only keep matched leads ---
-    combined = combined[combined[source_col_bats].notna()].copy()
-
+    # --- Only keep rows with a matched source ---
+    combined = first_pass[first_pass["Matched_Source"].notna()].copy()
     if combined.empty:
         final_cols = ["Order ID", "Name", "Agent", "Deposit", "Source"]
         empty = pd.DataFrame(columns=final_cols)
@@ -122,11 +118,10 @@ def process_sales_data(sales_df: pd.DataFrame, bats_df: pd.DataFrame) -> Tuple[p
         "Name":     combined[name_col_sales],
         "Agent":    combined[sales_agent_col],
         "Deposit":  combined[deposit_col_sales],
-        "Source":   combined[source_col_bats],
+        "Source":   combined["Matched_Source"],
     })
 
-    # --- Unique sale calculation: per (Source, Name, Agent) ---
-    # Store all order IDs as comma-separated string (hashable)
+    # --- Unique sale calculation ---
     out = (
         out.groupby(["Source", "Name", "Agent"], as_index=False)
         .agg({
@@ -135,7 +130,7 @@ def process_sales_data(sales_df: pd.DataFrame, bats_df: pd.DataFrame) -> Tuple[p
         })
     )
 
-    # Each (Source, Name, Agent) = 1 unique sale
+    # Summary per Source
     summary = (
         out.groupby("Source")
         .agg(Deposits=("Deposit", "sum"), Total_Unique_Sales=("Name", "count"))
